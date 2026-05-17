@@ -85,9 +85,18 @@ function generate_thumbnail(string $videoPath, string $thumbName): ?string {
         if (!@mkdir($screenshotsDir, 0755, true)) return null;
     }
     $thumbPath = $screenshotsDir . '/' . $thumbName;
-    // 1 кадр з 5-ї секунди, 1280x720, JPEG q4
+
+    // Беремо кадр з 15% тривалості відео. Fallback на 5с якщо ffprobe не зміг.
+    $probeCmd = sprintf(
+        'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 %s 2>/dev/null',
+        escapeshellarg($videoPath)
+    );
+    $duration = (float) trim((string) shell_exec($probeCmd));
+    $seekSec = $duration > 0 ? max(1, (int) round($duration * 0.15)) : 5;
+
     $cmd = sprintf(
-        'ffmpeg -y -ss 5 -i %s -frames:v 1 -q:v 4 -vf scale=1280:-2 %s 2>&1',
+        'ffmpeg -y -ss %d -i %s -frames:v 1 -q:v 4 -vf scale=1280:-2 %s 2>&1',
+        $seekSec,
         escapeshellarg($videoPath),
         escapeshellarg($thumbPath)
     );
