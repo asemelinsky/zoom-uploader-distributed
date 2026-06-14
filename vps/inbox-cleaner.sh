@@ -20,7 +20,7 @@ set -euo pipefail
 INBOX="/root/projects/zoom-inbox"   # real path, без symlink
 UPLOADED="/root/projects/zoom-uploader-distributed/vps/uploaded.log"
 LOG="/var/log/zoom-cleaner.log"
-TTL_DAYS=14
+TTL_DAYS=7
 
 mkdir -p "$INBOX"
 touch "$LOG" "$UPLOADED"
