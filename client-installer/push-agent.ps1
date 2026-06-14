@@ -31,7 +31,18 @@ Log "═══ push-agent start (comp=$($cfg.comp_name)) ═══"
 $state = @{}
 if (Test-Path $cfg.state_file) {
     try {
-        $state = Get-Content $cfg.state_file -Raw | ConvertFrom-Json -AsHashtable
+        # PS 5.1 (Win 10/11 stock) не має `-AsHashtable`. Парсимо як PSCustomObject
+        # і ручно конвертуємо у hashtable (значення лишаємо PSCustomObject — їх
+        # читаємо через dot-notation $state[$key].size що працює для обох типів).
+        $jsonRaw = Get-Content $cfg.state_file -Raw -Encoding UTF8
+        if ($jsonRaw -and $jsonRaw.Trim()) {
+            $parsed = $jsonRaw | ConvertFrom-Json
+            if ($parsed) {
+                $parsed.PSObject.Properties | ForEach-Object {
+                    $state[$_.Name] = $_.Value
+                }
+            }
+        }
     } catch {
         Log "WARN: state file парсе fail, починаю з порожнього: $_"
     }
@@ -46,34 +57,41 @@ if ($null -eq $state) { $state = @{} }
 # пропав/зламався.
 $vpsUploadedBasenames = $null
 try {
+    # ВАЖЛИВО — використовуємо SCP (binary copy) а не SSH cat (stdout decoded by PS
+    # console code page, що CP-866 на UA Win → кирилиця в basename ламається,
+    # HashSet lookup не співпадає, файли push-ляться повторно).
+    # SCP копіює байт-у-байт; читаємо локально з явним -Encoding UTF8.
     $tmpUploaded = Join-Path $env:TEMP "vps-uploaded-$(Get-Date -Format 'yyyyMMddHHmmss').log"
-    $sshArgs = @(
-        '-p', $cfg.vps_port,
+    $scpArgs = @(
+        '-P', $cfg.vps_port,
         '-i', $cfg.ssh_key_path,
         '-o', 'StrictHostKeyChecking=accept-new',
         '-o', 'ConnectTimeout=10',
         '-o', 'BatchMode=yes',
-        "$($cfg.vps_user)@$($cfg.vps_host)",
-        'cat /root/projects/zoom-uploader-distributed/vps/uploaded.log'
+        "$($cfg.vps_user)@$($cfg.vps_host):/root/projects/zoom-uploader-distributed/vps/uploaded.log",
+        $tmpUploaded
     )
-    $sshOut = & ssh.exe @sshArgs 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $sshOut | Out-File $tmpUploaded -Encoding utf8
-        $vpsUploadedBasenames = @{}
-        Get-Content $tmpUploaded -ErrorAction SilentlyContinue | ForEach-Object {
-            $parts = $_ -split '\|'
-            if ($parts.Count -ge 1 -and $parts[0]) {
-                $bn = Split-Path -Leaf $parts[0]
-                if ($bn) { $vpsUploadedBasenames[$bn] = $true }
+    $scpOut = & scp.exe @scpArgs 2>&1
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $tmpUploaded)) {
+        # case-insensitive HashSet (Win filesystem is case-insensitive)
+        $vpsUploadedBasenames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        Get-Content $tmpUploaded -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
+            $line = $_
+            if ($line) {
+                $parts = $line -split '\|'
+                if ($parts.Count -ge 1 -and $parts[0]) {
+                    $bn = Split-Path -Leaf $parts[0]
+                    if ($bn) { [void]$vpsUploadedBasenames.Add($bn) }
+                }
             }
         }
         Log "VPS uploaded.log: $($vpsUploadedBasenames.Count) basenames у YT (server-side dedup активний)"
         Remove-Item $tmpUploaded -ErrorAction SilentlyContinue
     } else {
-        Log "WARN: не вдалось зачитати VPS uploaded.log ($LASTEXITCODE) — server-side dedup ВИМКНЕНО на цей run, працюємо тільки на local state"
+        Log "WARN: не вдалось scp VPS uploaded.log ($LASTEXITCODE): $scpOut — server-side dedup ВИМКНЕНО на цей run, працюємо тільки на local state"
     }
 } catch {
-    Log "WARN: помилка SSH-fetch uploaded.log: $_ — server-side dedup ВИМКНЕНО"
+    Log "WARN: помилка SCP-fetch uploaded.log: $_ — server-side dedup ВИМКНЕНО"
 }
 
 # === Scan Zoom-folder ===
@@ -118,9 +136,10 @@ foreach ($file in $candidates) {
     $remoteFileName = "${safeParent}__$($file.Name)"
 
     # === Server-side dedup: skip якщо вже у VPS uploaded.log ===
-    if ($null -ne $vpsUploadedBasenames -and $vpsUploadedBasenames.ContainsKey($remoteFileName)) {
+    # HashSet.Contains (а не .ContainsKey — це HashSet, не Dictionary)
+    if ($null -ne $vpsUploadedBasenames -and $vpsUploadedBasenames.Contains($remoteFileName)) {
         Log "  SKIP (already on YouTube via VPS uploaded.log): $remoteFileName"
-        # Заповнимо локальний state щоб наступний run скіпав швидко без SSH-check
+        # Заповнимо локальний state щоб наступний run скіпав швидко без SCP-check
         $state[$key] = @{
             size = $size
             mtime = $mtime
