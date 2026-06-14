@@ -122,22 +122,36 @@ foreach ($file in $candidates) {
         continue
     }
 
-    # === Skip якщо вже pushed з тим самим size+mtime ===
-    if ($state.ContainsKey($key)) {
-        $prev = $state[$key]
-        if ($prev.size -eq $size -and $prev.mtime -eq $mtime) {
-            $skippedCount++
-            continue
-        }
-    }
-
     # === Build remote filename з parent-folder як префікс ===
     # Zoom створює папки типу "2026-05-09 14.30.45 Назва зустрічі" — це наш title.
     # Sanitize spaces/special chars щоб не псувати scp/filesystem.
     $parentName = $file.Directory.Name
-    # Замінити характери що ламають shell або погано читаються (spaces, brackets тощо) на дефіс.
     $safeParent = ($parentName -replace '[<>:"/\\|?*]', '_') -replace '\s+', '_'
     $remoteFileName = "${safeParent}__$($file.Name)"
+
+    # === Skip якщо вже pushed з тим самим size+mtime ===
+    if ($state.ContainsKey($key)) {
+        $prev = $state[$key]
+        if ($prev.size -eq $size -and $prev.mtime -eq $mtime) {
+            # BACKFILL: якщо state має fake pushed_at = недавня дата (стара версія
+            # скрипта писала NOW при VPS-dedup) і VPS знає реальний upload-timestamp —
+            # перепишемо state з реальним. Це робить auto-cleanup негайно ефективним
+            # після migration зі старої версії.
+            if ($null -ne $vpsUploadedBasenames -and $vpsUploadedBasenames.ContainsKey($remoteFileName)) {
+                $vpsTs = $vpsUploadedBasenames[$remoteFileName]
+                if ($vpsTs -and $vpsTs -ne $prev.pushed_at) {
+                    $state[$key] = @{
+                        size = $size
+                        mtime = $mtime
+                        pushed_at = $vpsTs
+                        source = 'vps-dedup-backfill'
+                    }
+                }
+            }
+            $skippedCount++
+            continue
+        }
+    }
 
     # === Server-side dedup: skip якщо вже у VPS uploaded.log ===
     if ($null -ne $vpsUploadedBasenames -and $vpsUploadedBasenames.ContainsKey($remoteFileName)) {
