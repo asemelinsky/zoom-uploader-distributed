@@ -185,6 +185,86 @@ foreach ($file in $candidates) {
     }
 }
 
+# === Auto-cleanup: видалити локальні Zoom-папки повністю pushed > N днів тому ===
+# Default TTL = 7d. Можна змінити у config.json -> "cleanup_age_days": N. Якщо 0 — вимкнено.
+$cleanupAgeDays = 7
+if ($cfg.PSObject.Properties.Match('cleanup_age_days').Count -gt 0) {
+    $cleanupAgeDays = [int]$cfg.cleanup_age_days
+}
+
+if ($cleanupAgeDays -gt 0) {
+    Log "Auto-cleanup перевірка (TTL=${cleanupAgeDays}d)..."
+    $now = Get-Date
+    $deletedFolders = 0
+    $deletedBytes = 0L
+
+    # Групуємо state по parent-folder
+    $folderGroups = @{}
+    foreach ($entry in $state.GetEnumerator()) {
+        $parentDir = Split-Path -Parent $entry.Key
+        if (-not $folderGroups.ContainsKey($parentDir)) {
+            $folderGroups[$parentDir] = New-Object 'System.Collections.Generic.List[string]'
+        }
+        $folderGroups[$parentDir].Add($entry.Key)
+    }
+
+    foreach ($folder in @($folderGroups.Keys)) {
+        if (-not (Test-Path $folder)) { continue }
+        # SAFETY: тільки у межах Zoom folder, ніколи назовні
+        $zoomRoot = (Resolve-Path $cfg.zoom_folder -ErrorAction SilentlyContinue).Path
+        $folderResolved = (Resolve-Path $folder -ErrorAction SilentlyContinue).Path
+        if (-not $zoomRoot -or -not $folderResolved -or -not $folderResolved.StartsWith($zoomRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        # Не видаляти сам корінь Zoom folder
+        if ($folderResolved.TrimEnd('\') -eq $zoomRoot.TrimEnd('\')) { continue }
+
+        # Перевіряємо що ВСІ поточні video-файли у папці є у state і pushed >= TTL days ago
+        $currentVideos = Get-ChildItem -Path $folder -Recurse -ErrorAction SilentlyContinue |
+                         Where-Object { -not $_.PSIsContainer -and $videoExt -contains $_.Extension.ToLower() }
+
+        if ($currentVideos.Count -eq 0) { continue }
+
+        $allOldEnough = $true
+        $oldestAge = 0
+        foreach ($video in $currentVideos) {
+            if (-not $state.ContainsKey($video.FullName)) {
+                $allOldEnough = $false
+                break
+            }
+            try {
+                $pushedAt = [DateTime]::Parse($state[$video.FullName].pushed_at)
+                $ageDays = ($now - $pushedAt).TotalDays
+                if ($ageDays -lt $cleanupAgeDays) { $allOldEnough = $false; break }
+                if ($ageDays -gt $oldestAge) { $oldestAge = $ageDays }
+            } catch {
+                $allOldEnough = $false; break
+            }
+        }
+
+        if ($allOldEnough) {
+            $folderSize = (Get-ChildItem $folder -Recurse -ErrorAction SilentlyContinue |
+                           Measure-Object -Property Length -Sum).Sum
+            try {
+                Remove-Item -Path $folder -Recurse -Force -ErrorAction Stop
+                Log "  CLEANUP: $folder ($([math]::Round($folderSize/1MB, 0)) MB, oldest push $([math]::Round($oldestAge,1))d ago)"
+                $deletedFolders++
+                $deletedBytes += $folderSize
+                # Прибираємо stale state-entries
+                foreach ($video in $currentVideos) {
+                    $state.Remove($video.FullName)
+                }
+            } catch {
+                Log "  CLEANUP FAIL: $folder — $_"
+            }
+        }
+    }
+
+    if ($deletedFolders -gt 0) {
+        Log "Auto-cleanup підсумок: видалено $deletedFolders папок ($([math]::Round($deletedBytes/1GB,2)) GB)"
+    }
+}
+
 # === Final state save (на випадок якщо incremental fail-or-був skipped-only run) ===
 $state | ConvertTo-Json -Depth 5 | Out-File $cfg.state_file -Encoding utf8
 
