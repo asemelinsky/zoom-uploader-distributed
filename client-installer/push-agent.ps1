@@ -38,6 +38,44 @@ if (Test-Path $cfg.state_file) {
 }
 if ($null -eq $state) { $state = @{} }
 
+# === VPS-side dedup (захист від data loss якщо local state пропав) ===
+# Тягнемо uploaded.log з VPS і будуємо HashSet basenames. Якщо файл уже залитий на
+# YouTube колись (запис у uploaded.log) — НЕ пушимо повторно, навіть якщо локальний
+# state не знає про нього. Це root-cause fix для "перезаливання 38GB старих файлів"
+# що траплялось коли cleaner видалив з VPS inbox через TTL, а local state на ноуті
+# пропав/зламався.
+$vpsUploadedBasenames = $null
+try {
+    $tmpUploaded = Join-Path $env:TEMP "vps-uploaded-$(Get-Date -Format 'yyyyMMddHHmmss').log"
+    $sshArgs = @(
+        '-p', $cfg.vps_port,
+        '-i', $cfg.ssh_key_path,
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'BatchMode=yes',
+        "$($cfg.vps_user)@$($cfg.vps_host)",
+        'cat /root/projects/zoom-uploader-distributed/vps/uploaded.log'
+    )
+    $sshOut = & ssh.exe @sshArgs 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $sshOut | Out-File $tmpUploaded -Encoding utf8
+        $vpsUploadedBasenames = @{}
+        Get-Content $tmpUploaded -ErrorAction SilentlyContinue | ForEach-Object {
+            $parts = $_ -split '\|'
+            if ($parts.Count -ge 1 -and $parts[0]) {
+                $bn = Split-Path -Leaf $parts[0]
+                if ($bn) { $vpsUploadedBasenames[$bn] = $true }
+            }
+        }
+        Log "VPS uploaded.log: $($vpsUploadedBasenames.Count) basenames у YT (server-side dedup активний)"
+        Remove-Item $tmpUploaded -ErrorAction SilentlyContinue
+    } else {
+        Log "WARN: не вдалось зачитати VPS uploaded.log ($LASTEXITCODE) — server-side dedup ВИМКНЕНО на цей run, працюємо тільки на local state"
+    }
+} catch {
+    Log "WARN: помилка SSH-fetch uploaded.log: $_ — server-side dedup ВИМКНЕНО"
+}
+
 # === Scan Zoom-folder ===
 # Тільки відео: m4a — окремий audio-only трек Zoom, дублює звук вже у .mp4
 $videoExt = @('.mp4', '.mkv', '.mov')
@@ -79,6 +117,20 @@ foreach ($file in $candidates) {
     $safeParent = ($parentName -replace '[<>:"/\\|?*]', '_') -replace '\s+', '_'
     $remoteFileName = "${safeParent}__$($file.Name)"
 
+    # === Server-side dedup: skip якщо вже у VPS uploaded.log ===
+    if ($null -ne $vpsUploadedBasenames -and $vpsUploadedBasenames.ContainsKey($remoteFileName)) {
+        Log "  SKIP (already on YouTube via VPS uploaded.log): $remoteFileName"
+        # Заповнимо локальний state щоб наступний run скіпав швидко без SSH-check
+        $state[$key] = @{
+            size = $size
+            mtime = $mtime
+            pushed_at = (Get-Date -Format 'o')
+            source = 'vps-dedup'
+        }
+        $skippedCount++
+        continue
+    }
+
     # === Push (через scp — вбудований у Win 10+) ===
     $remotePath = "$($cfg.vps_user)@$($cfg.vps_host):$($cfg.vps_inbox_path)/$remoteFileName"
 
@@ -100,13 +152,21 @@ foreach ($file in $candidates) {
         }
         $pushedCount++
         Log "    OK"
+        # === INCREMENTAL save: пишемо state після КОЖНОГО успішного push ===
+        # Захист від Task Scheduler timeout-kill (1h limit у settings) — якщо скрипт
+        # приб'ють у середині, попередні success вже у файлі і наступний run їх скіпне.
+        try {
+            $state | ConvertTo-Json -Depth 5 | Out-File $cfg.state_file -Encoding utf8 -ErrorAction Stop
+        } catch {
+            Log "    WARN: state save fail: $_"
+        }
     } else {
         $failedCount++
         Log "    FAIL: $rsyncOut"
     }
 }
 
-# === Save state ===
+# === Final state save (на випадок якщо incremental fail-or-був skipped-only run) ===
 $state | ConvertTo-Json -Depth 5 | Out-File $cfg.state_file -Encoding utf8
 
 Log "Підсумок: pushed=$pushedCount, skipped=$skippedCount, failed=$failedCount"
