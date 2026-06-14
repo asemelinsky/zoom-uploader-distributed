@@ -1,17 +1,26 @@
 #!/bin/bash
-# inbox-cleaner.sh
-# TTL-based cleanup для /root/zoom-inbox/.
-# Видаляє відео-файли старіші TTL_DAYS — АЛЕ тільки якщо вони присутні у uploaded.log.
-# Файли які не uploaded (напр. quota exhausted кілька днів поспіль) — зберігаються,
-# щоб наступний cron run їх дозалив. Це prevent'ить data loss.
+# inbox-cleaner.sh v2 (2026-06-07)
+#
+# TTL-based cleanup для /root/projects/zoom-inbox/ (real path, не через symlink).
+# Видаляє відео-файли старіші TTL_DAYS від моменту UPLOAD на YouTube.
+# Файли НЕ у uploaded.log → зберігаються (не uploaded — захист від data loss).
 # Trigger: cron `0 1 * * *` (раз на день о 01:00 UTC = ~04:00 Київ).
+#
+# Чому v2: v1 (інший repo) використовував `find /root/zoom-inbox` (symlink) +
+# matching по full path. Це не працювало через 3 баги:
+#   1. Symlink не traverse'ився find'ом → 0 файлів знайдено
+#   2. Path mismatch: uploaded.log містив /root/zoom-inbox/... а find повертав
+#      /root/projects/zoom-inbox/... — `grep -qF "$f|"` нічого не співпадав
+#   3. Старі entries мали короткі names (videoXXX.mp4), нові — з prefix дати +
+#      meeting title — повний шлях кожному різний
+# v2 робить matching по basename + use `upload_timestamp` з ISO в 3-й колонці.
 
 set -euo pipefail
 
-INBOX="/root/zoom-inbox"
+INBOX="/root/projects/zoom-inbox"   # real path, без symlink
 UPLOADED="/root/projects/zoom-uploader-distributed/vps/uploaded.log"
 LOG="/var/log/zoom-cleaner.log"
-TTL_DAYS=2
+TTL_DAYS=14
 
 mkdir -p "$INBOX"
 touch "$LOG" "$UPLOADED"
@@ -20,28 +29,58 @@ log() {
   echo "[$(date '+%F %T')] $*" >> "$LOG"
 }
 
-log "═══ cleaner start ═══"
+log "═══ cleaner v2 start (TTL=${TTL_DAYS}d, inbox=$INBOX) ═══"
 
+# Build map: basename → upload_timestamp_epoch
+declare -A UPLOADED_MAP
+while IFS='|' read -r path youtube_id ts; do
+  [ -z "$path" ] && continue
+  bn=$(basename "$path")
+  # ISO → epoch
+  ts_epoch=$(date -d "$ts" +%s 2>/dev/null || echo 0)
+  if [ "$ts_epoch" -gt 0 ]; then
+    UPLOADED_MAP["$bn"]="$ts_epoch"
+  fi
+done < "$UPLOADED"
+
+log "uploaded.log: ${#UPLOADED_MAP[@]} entries"
+
+now=$(date +%s)
 deleted_count=0
-retained_count=0
+retained_uploaded=0
+retained_pending=0
 total_size=0
 
+# Find усі video-файли
 while IFS= read -r -d '' f; do
-    size=$(stat -c %s "$f" 2>/dev/null || echo 0)
-    if grep -qF "$f|" "$UPLOADED"; then
-        rm -f "$f" && {
-            log "  DEL: $f ($((size / 1024 / 1024)) MB)"
-            deleted_count=$((deleted_count + 1))
-            total_size=$((total_size + size))
-        }
+  bn=$(basename "$f")
+  size=$(stat -c %s "$f" 2>/dev/null || echo 0)
+
+  if [ -n "${UPLOADED_MAP[$bn]:-}" ]; then
+    # У uploaded.log є — перевіряємо age від upload_timestamp
+    upload_ts=${UPLOADED_MAP[$bn]}
+    age_days=$(( (now - upload_ts) / 86400 ))
+    if [ "$age_days" -ge "$TTL_DAYS" ]; then
+      if rm -f "$f"; then
+        log "  DEL: $bn ($((size/1024/1024))MB, uploaded ${age_days}d ago)"
+        deleted_count=$((deleted_count + 1))
+        total_size=$((total_size + size))
+      else
+        log "  ERR: rm failed for $f"
+      fi
     else
-        log "  RETAIN: $f ($((size / 1024 / 1024)) MB) — not in uploaded.log, awaiting upload retry"
-        retained_count=$((retained_count + 1))
+      log "  KEEP: $bn (uploaded ${age_days}d ago, < TTL)"
+      retained_uploaded=$((retained_uploaded + 1))
     fi
-done < <(find "$INBOX" -type f \( -iname '*.mp4' -o -iname '*.m4a' -o -iname '*.mkv' -o -iname '*.mov' \) -mtime +"$TTL_DAYS" -print0)
+  else
+    log "  RETAIN: $bn ($((size/1024/1024))MB) — not in uploaded.log, awaiting upload"
+    retained_pending=$((retained_pending + 1))
+  fi
+done < <(find "$INBOX" -type f \( -iname '*.mp4' -o -iname '*.m4a' -o -iname '*.mkv' -o -iname '*.mov' \) -print0)
 
-# Видалити порожні sub-папки comp/<meeting>/ але НЕ сам comp/
-find "$INBOX" -mindepth 2 -type d -empty -delete 2>/dev/null || true
+# Видалити порожні sub-папки (meeting subdirs) але не корінь і не $INBOX/<host>/
+find "$INBOX" -mindepth 3 -type d -empty -delete 2>/dev/null || true
 
-log "Підсумок: видалено $deleted_count файлів ($((total_size / 1024 / 1024)) MB), retained $retained_count файлів (не uploaded)"
-log "═══ cleaner end ═══"
+total_mb=$((total_size / 1024 / 1024))
+log "Підсумок: видалено $deleted_count файлів (${total_mb} MB), kept-fresh=$retained_uploaded, kept-pending=$retained_pending"
+log "═══ cleaner v2 end ═══"
