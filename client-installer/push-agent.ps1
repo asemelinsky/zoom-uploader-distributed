@@ -73,15 +73,19 @@ try {
     )
     $scpOut = & scp.exe @scpArgs 2>&1
     if ($LASTEXITCODE -eq 0 -and (Test-Path $tmpUploaded)) {
-        # case-insensitive HashSet (Win filesystem is case-insensitive)
-        $vpsUploadedBasenames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        # Dict basename → upload_timestamp (ISO). Lookup + age check для cleanup.
+        # Comparer OrdinalIgnoreCase — Win filesystem case-insensitive.
+        $vpsUploadedBasenames = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
         Get-Content $tmpUploaded -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
             $line = $_
             if ($line) {
                 $parts = $line -split '\|'
                 if ($parts.Count -ge 1 -and $parts[0]) {
                     $bn = Split-Path -Leaf $parts[0]
-                    if ($bn) { [void]$vpsUploadedBasenames.Add($bn) }
+                    $ts = if ($parts.Count -ge 3) { $parts[2] } else { '' }
+                    if ($bn -and -not $vpsUploadedBasenames.ContainsKey($bn)) {
+                        $vpsUploadedBasenames.Add($bn, $ts)
+                    }
                 }
             }
         }
@@ -136,14 +140,17 @@ foreach ($file in $candidates) {
     $remoteFileName = "${safeParent}__$($file.Name)"
 
     # === Server-side dedup: skip якщо вже у VPS uploaded.log ===
-    # HashSet.Contains (а не .ContainsKey — це HashSet, не Dictionary)
-    if ($null -ne $vpsUploadedBasenames -and $vpsUploadedBasenames.Contains($remoteFileName)) {
+    if ($null -ne $vpsUploadedBasenames -and $vpsUploadedBasenames.ContainsKey($remoteFileName)) {
         Log "  SKIP (already on YouTube via VPS uploaded.log): $remoteFileName"
-        # Заповнимо локальний state щоб наступний run скіпав швидко без SCP-check
+        # Використовуємо РЕАЛЬНИЙ upload timestamp з VPS (а не сьогоднішню дату)
+        # — щоб auto-cleanup міг видалити одразу старі папки (>TTL d тому).
+        # Якщо VPS не передав timestamp у 3-й колонці — fallback на сьогодні.
+        $vpsTs = $vpsUploadedBasenames[$remoteFileName]
+        $pushedAtIso = if ($vpsTs) { $vpsTs } else { (Get-Date -Format 'o') }
         $state[$key] = @{
             size = $size
             mtime = $mtime
-            pushed_at = (Get-Date -Format 'o')
+            pushed_at = $pushedAtIso
             source = 'vps-dedup'
         }
         $skippedCount++
